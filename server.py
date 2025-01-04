@@ -1,137 +1,118 @@
 import socket
 import threading
+import time
 import logging
-import os
 
-# Configuration
-HOST = '0.0.0.0'  # Listen on all available interfaces
+# Server configuration
+HOST = "0.0.0.0"  # Listen on all interfaces
 PORT = 9000       # Port for the C2 server
-COUNTER_FILE = "client_counter.txt"
-clients = []
+HEARTBEAT_INTERVAL = 60  # Time in seconds before a client is considered timed out
 
-# Logging configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
-# Initialize client counter
-client_counter = 0
+class C2Server:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.clients = {}  # Tracks clients by their ID
+        self.client_counter = 0
+        self.lock = threading.Lock()
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
+    def log(self, message):
+        logging.info(message)
 
-def load_client_counter():
-    """
-    Load the client counter from a file.
-    """
-    global client_counter
-    if os.path.exists(COUNTER_FILE):
+    def start(self):
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        self.log(f"Server started on {self.host}:{self.port}")
+
         try:
-            with open(COUNTER_FILE, "r") as file:
-                client_counter = int(file.read().strip())
-                logging.info(f"[+] Loaded client counter: {client_counter}")
+            while True:
+                client_socket, client_address = self.server_socket.accept()
+                with self.lock:
+                    self.client_counter += 1
+                    client_id = self.client_counter
+
+                # Initialize client entry
+                self.clients[client_id] = {
+                    "socket": client_socket,
+                    "address": client_address,
+                    "last_heartbeat": time.time(),
+                    "authenticated": False,
+                    "active": True,
+                }
+                self.log(f"Client {client_id} ({client_address}) CONNECTED")
+                threading.Thread(
+                    target=self.handle_client, args=(client_id,), daemon=True
+                ).start()
+
+        except KeyboardInterrupt:
+            self.log("Shutting down server...")
+        finally:
+            self.server_socket.close()
+
+    def handle_client(self, client_id):
+        client = self.clients[client_id]
+        client_socket = client["socket"]
+        client_address = client["address"]
+
+        try:
+            # Send initial authentication message with client ID
+            auth_message = f"CLIENT_ID {client_id}\nAUTH_TOKEN PLACEHOLDER_TOKEN\n"
+            client_socket.sendall(auth_message.encode("utf-8"))
+
+            while client["active"]:
+                try:
+                    message = client_socket.recv(1024).decode("utf-8").strip()
+                    if not message:
+                        break
+
+                    if message == "HEARTBEAT":
+                        client["last_heartbeat"] = time.time()
+                        self.log(f"Client {client_id} ({client_address}) HEARTBEAT received")
+
+                    elif message.startswith("AUTH"):
+                        _, auth_token = message.split(maxsplit=1)
+                        if auth_token == "PLACEHOLDER_TOKEN":  # Replace with real validation
+                            client["authenticated"] = True
+                            client_socket.sendall("AUTH_SUCCESS\n".encode("utf-8"))
+                            self.log(f"Client {client_id} ({client_address}) AUTHENTICATED")
+                        else:
+                            client_socket.sendall("AUTH_FAIL\n".encode("utf-8"))
+
+                    elif message == "EXIT":
+                        self.log(f"Client {client_id} ({client_address}) DISCONNECTED")
+                        break
+
+                    else:
+                        response = "UNKNOWN_COMMAND\n"
+                        client_socket.sendall(response.encode("utf-8"))
+
+                except socket.timeout:
+                    continue
+
+                # Check for heartbeat timeout
+                if time.time() - client["last_heartbeat"] > HEARTBEAT_INTERVAL:
+                    self.log(f"Client {client_id} ({client_address}) HEARTBEAT_TIMEOUT")
+                    break
+
         except Exception as e:
-            logging.error(f"[-] Error reading client counter file: {e}")
-            client_counter = 0
-    else:
-        logging.info("[+] No counter file found. Starting from 0.")
+            self.log(f"Error with client {client_id}: {e}")
 
-
-def save_client_counter():
-    """
-    Save the client counter to a file.
-    """
-    try:
-        with open(COUNTER_FILE, "w") as file:
-            file.write(str(client_counter))
-            logging.info(f"[+] Saved client counter: {client_counter}")
-    except Exception as e:
-        logging.error(f"[-] Error saving client counter: {e}")
-
-
-def process_command(data, addr, auth_token):
-    """
-    Processes incoming commands and returns the appropriate response.
-    """
-    command_parts = data.split(" ", 1)
-    command = command_parts[0].upper()
-    args = command_parts[1] if len(command_parts) > 1 else ""
-
-    if command == "PING":
-        return "PONG", auth_token
-    elif command == "AUTH":
-        if args == auth_token:
-            return "AUTH_SUCCESS", auth_token
-        else:
-            return "AUTH_FAIL", auth_token
-    elif command == "CMD":
-        return f"EXECUTED: {args}", auth_token  # Replace with actual command execution logic
-    elif command == "EXIT":
-        return "GOODBYE", auth_token
-    else:
-        return "ERROR: UNKNOWN_COMMAND", auth_token
-
-
-def handle_client(conn, addr):
-    """
-    Handles communication with a single client.
-    """
-    global client_counter
-    logging.info(f"[+] New connection from {addr}")
-
-    # Assign a unique client ID and token
-    client_id = client_counter
-    client_counter += 1
-    auth_token = f"TOKEN-{client_id}"
-
-    # Send client ID and auth token
-    conn.sendall(f"CLIENT_ID {client_id}\nAUTH_TOKEN {auth_token}".encode('utf-8'))
-
-    try:
-        while True:
-            data = conn.recv(1024).decode('utf-8').strip()
-            if not data:
-                break
-
-            logging.info(f"[DATA] From {addr}: {data}")
-
-            # Process the command
-            response, auth_token = process_command(data, addr, auth_token)
-
-            # Send the response back to the client
-            conn.sendall(response.encode('utf-8'))
-
-            if response == "GOODBYE":
-                break
-    except Exception as e:
-        logging.error(f"[-] Error with {addr}: {e}")
-    finally:
-        clients.remove(conn)
-        conn.close()
-        logging.info(f"[-] Connection closed: {addr}")
-
-
-def start_server():
-    """
-    Starts the server and listens for incoming connections.
-    """
-    global client_counter
-    load_client_counter()
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((HOST, PORT))
-    server.listen(5)
-    logging.info(f"[+] Server started on {HOST}:{PORT}")
-
-    try:
-        while True:
-            conn, addr = server.accept()
-            clients.append(conn)
-            client_thread = threading.Thread(target=handle_client, args=(conn, addr))
-            client_thread.daemon = True
-            client_thread.start()
-    except KeyboardInterrupt:
-        logging.info("[-] Server shutting down.")
-        save_client_counter()
-    finally:
-        server.close()
-
+        finally:
+            # Clean up client
+            with self.lock:
+                client["active"] = False
+                client_socket.close()
+                del self.clients[client_id]
+            self.log(f"Client {client_id} ({client_address}) DISCONNECTED")
 
 if __name__ == "__main__":
-    start_server()
+    server = C2Server(HOST, PORT)
+    server.start()
