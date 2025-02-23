@@ -6,7 +6,8 @@ from colorama import Fore, Style, init  # For color-coded feedback
 # This serves as the operator panel for managing clients and sending commands
 # 
 # PLANNED:
-# command logging for other operators
+# command logging for other operators + user panel
+# more commands n make easier to nav
 # better auth lol
 
 # Initialize colorama
@@ -18,7 +19,7 @@ SERVER_PORT = 9000
 
 # Authentication credentials (placeholder)
 USERNAME = "admin"
-PASSWORD = "password123"
+PASSWORD = "nimda"
 
 # Function to display available commands
 def show_commands():
